@@ -1,0 +1,3 @@
+-- 00.init.sql
+CREATE USER tvea WITH PASSWORD '1234';
+CREATE DATABASE tvea OWNER tvea;
