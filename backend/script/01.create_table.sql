@@ -50,7 +50,7 @@ CREATE INDEX idx_videos_user_id
 
 
 
-CREATE TABLE   (
+CREATE TABLE analysis_jobs (
                                id UUID PRIMARY KEY,
 
                                video_id UUID NOT NULL,
