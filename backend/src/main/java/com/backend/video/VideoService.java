@@ -1,5 +1,7 @@
 package com.backend.video;
 
+import com.backend.analysis.AnalysisJob;
+import com.backend.analysis.AnalysisJobService;
 import com.backend.exception.FfprobeExecutionException;
 import com.backend.exception.InvalidVideoException;
 import com.backend.exception.StorageException;
@@ -8,6 +10,7 @@ import com.backend.exception.VideoValidationException;
 import com.backend.video.dto.VideoUploadResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
@@ -29,6 +32,7 @@ public class VideoService {
     private final S3StorageService s3StorageService;
     private final VideoMetadataExtractor videoMetadataExtractor;
     private final VideoPersistenceService videoPersistenceService;
+    private final AnalysisJobService analysisJobService;
     private final long maxFileSizeBytes;
 
     public VideoService(
@@ -36,12 +40,14 @@ public class VideoService {
             S3StorageService s3StorageService,
             VideoMetadataExtractor videoMetadataExtractor,
             VideoPersistenceService videoPersistenceService,
+            AnalysisJobService analysisJobService,
             @Value("${app.video.max-file-size-bytes}") long maxFileSizeBytes
     ) {
         this.videoFilePolicy = videoFilePolicy;
         this.s3StorageService = s3StorageService;
         this.videoMetadataExtractor = videoMetadataExtractor;
         this.videoPersistenceService = videoPersistenceService;
+        this.analysisJobService = analysisJobService;
         this.maxFileSizeBytes = maxFileSizeBytes;
     }
 
@@ -57,6 +63,7 @@ public class VideoService {
 
         File tempFile = null;
         boolean s3Uploaded = false;
+        VideoPersistenceService.SavedVideoAndJob saved = null;
         try {
             tempFile = Files.createTempFile("video-upload-", ".MOV").toFile(); //os가 알아서 임시 디렉토리를 지정함. 메타데이터 추출하기 위해 임시로 저장
             file.transferTo(tempFile);
@@ -72,9 +79,11 @@ public class VideoService {
             }
             log.info("video metadata extraction completed. userId={}, videoId={}, s3Key={}", userId, videoId, s3Key);
 
-            Video saved = saveVideo(file, userId, videoId, originalFilename, contentType, s3Key, metadata);
+            saved = saveVideoAndJob(file, userId, videoId, originalFilename, contentType, s3Key, metadata);
             log.info("video saved successfully. userId={}, videoId={}, s3Key={}", userId, videoId, s3Key);
-            return toResponse(saved);
+            MDC.put("job_id", saved.getJob().getId().toString());
+            MDC.put("video_id", videoId.toString());
+            log.info("analysis job created");
         } catch (StorageException e) {
             log.error("S3 upload failed. userId={}, videoId={}, s3Key={}", userId, videoId, s3Key, e);
             throw e;
@@ -98,6 +107,14 @@ public class VideoService {
         } finally {
             deleteTempFile(tempFile, userId, videoId, s3Key);
         }
+
+        try {
+            analysisJobService.dispatchToFastApi(saved.getJob(), saved.getVideo().getS3Key());
+        } catch (RuntimeException e) {
+            log.error("FastAPI dispatch failed after video save. userId={}, videoId={}, jobId={}",
+                    userId, videoId, saved.getJob().getId(), e);
+        }
+        return toResponse(saved.getVideo());
     }
 
     private void validateFile(MultipartFile file, Long userId) {
@@ -130,7 +147,15 @@ public class VideoService {
         return "videos/" + datePath + "/" + videoId + ".MOV";
     }
 
-    private Video saveVideo(MultipartFile file, Long userId, UUID videoId, String originalFilename, String contentType, String s3Key, VideoMetadata metadata) {
+    private VideoPersistenceService.SavedVideoAndJob saveVideoAndJob(
+            MultipartFile file,
+            Long userId,
+            UUID videoId,
+            String originalFilename,
+            String contentType,
+            String s3Key,
+            VideoMetadata metadata
+    ) {
         try {
             Video video = new Video();
             video.setId(videoId);
@@ -144,7 +169,9 @@ public class VideoService {
             video.setHeight(metadata.getHeight());
             video.setFrameRate(metadata.getFrameRate());
             video.setRecordedAt(metadata.getRecordedAt());
-            return videoPersistenceService.save(video);
+
+            AnalysisJob job = analysisJobService.newPendingJob(video);
+            return videoPersistenceService.saveVideoAndJob(video, job);
         } catch (RuntimeException e) {
             log.error("video DB save failed. userId={}, videoId={}, s3Key={}", userId, videoId, s3Key, e);
             throw new VideoSaveFailedException("영상 저장에 실패했습니다.", e);

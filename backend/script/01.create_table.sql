@@ -95,3 +95,55 @@ COMMENT ON COLUMN analysis_jobs.error_code IS '실패 코드';
 COMMENT ON COLUMN analysis_jobs.error_message IS '실패 메시지';
 COMMENT ON COLUMN analysis_jobs.created_at IS 'Job 생성(분석 요청) 시각';
 COMMENT ON COLUMN analysis_jobs.updated_at IS '최종 수정 시각';
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    CREATE TABLE analysis_results (
+                                      id UUID PRIMARY KEY,
+                                      analysis_job_id UUID NOT NULL UNIQUE,
+
+                                      is_valid BOOLEAN,
+                                      violation_detected BOOLEAN,
+
+                                      summary TEXT,
+                                      result_data JSONB,
+
+                                      result_s3_key VARCHAR(500),
+
+                                      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+                                      CONSTRAINT fk_analysis_results_job
+                                          FOREIGN KEY (analysis_job_id)
+                                              REFERENCES analysis_jobs(id)
+    );
+ALTER TABLE analysis_results OWNER TO tvea;
+
+COMMENT ON TABLE analysis_results IS '영상 분석 작업의 최종 분석 결과';
+
+COMMENT ON COLUMN analysis_results.id IS '분석 결과 ID';
+COMMENT ON COLUMN analysis_results.analysis_job_id IS '분석 작업 ID (1:1 관계)';
+COMMENT ON COLUMN analysis_results.is_valid IS '분석 대상 영상의 유효성 여부';
+COMMENT ON COLUMN analysis_results.violation_detected IS '교통법규 위반 발견 여부';
+COMMENT ON COLUMN analysis_results.summary IS '분석 결과 요약';
+COMMENT ON COLUMN analysis_results.result_data IS '상세 분석 결과 JSON 데이터';
+COMMENT ON COLUMN analysis_results.result_s3_key IS '상세 분석 결과 파일의 S3 객체 키';
+COMMENT ON COLUMN analysis_results.created_at IS '분석 결과 생성 시각';
+
+
+
+ALTER TABLE analysis_jobs
+    ADD COLUMN accepted_at TIMESTAMP;
+
+COMMENT ON COLUMN analysis_jobs.accepted_at
+IS 'FastAPI가 분석 작업 요청을 정상 접수한 시각';
