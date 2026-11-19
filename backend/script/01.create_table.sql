@@ -57,6 +57,7 @@ CREATE TABLE analysis_jobs (
 
                                status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
 
+                               accepted_at TIMESTAMP,
                                started_at TIMESTAMP,
                                finished_at TIMESTAMP,
 
@@ -73,7 +74,10 @@ CREATE TABLE analysis_jobs (
                                        REFERENCES videos(id),
 
                                CONSTRAINT chk_analysis_jobs_status
-                                   CHECK (status IN ('PENDING', 'PROCESSING', 'COMPLETED', 'FAILED'))
+                                   CHECK (status IN ('PENDING', 'PROCESSING', 'COMPLETED', 'FAILED')),
+
+                               CONSTRAINT chk_analysis_jobs_retry_count
+                                   CHECK (retry_count >= 0)
 );
 
 ALTER TABLE analysis_jobs OWNER TO tvea;
@@ -95,7 +99,7 @@ COMMENT ON COLUMN analysis_jobs.error_code IS '실패 코드';
 COMMENT ON COLUMN analysis_jobs.error_message IS '실패 메시지';
 COMMENT ON COLUMN analysis_jobs.created_at IS 'Job 생성(분석 요청) 시각';
 COMMENT ON COLUMN analysis_jobs.updated_at IS '최종 수정 시각';
-
+COMMENT ON COLUMN analysis_jobs.accepted_at IS 'FastAPI가 분석 작업 요청을 정상 접수한 시각';
 
 
 
@@ -141,9 +145,5 @@ COMMENT ON COLUMN analysis_results.result_s3_key IS '상세 분석 결과 파일
 COMMENT ON COLUMN analysis_results.created_at IS '분석 결과 생성 시각';
 
 
-
-ALTER TABLE analysis_jobs
-    ADD COLUMN accepted_at TIMESTAMP;
-
-COMMENT ON COLUMN analysis_jobs.accepted_at
-IS 'FastAPI가 분석 작업 요청을 정상 접수한 시각';
+-- ALTER TABLE analysis_jobs
+-- ADD COLUMN accepted_at TIMESTAMP;
