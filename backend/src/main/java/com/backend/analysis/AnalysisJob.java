@@ -16,6 +16,13 @@ public class AnalysisJob {
 
     public static final String STATUS_PENDING = "PENDING";
     public static final String STATUS_FAILED = "FAILED";
+    public static final String STATUS_COMPLETED = "COMPLETED";
+
+    /** Resends after the first submit. Callback retry is a separate policy. */
+    public static final int MAX_DISPATCH_RESENDS = 2;
+
+    public static final String ERROR_DISPATCH_RETRY_EXHAUSTED = "DISPATCH_RETRY_EXHAUSTED";
+    public static final String ERROR_RECOVERY_NOT_IMPLEMENTED = "RECOVERY_NOT_IMPLEMENTED";
 
     @Id
     private UUID id;

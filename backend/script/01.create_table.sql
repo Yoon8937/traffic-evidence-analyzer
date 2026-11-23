@@ -89,9 +89,10 @@ CREATE INDEX idx_analysis_jobs_status
 
 COMMENT ON TABLE analysis_jobs IS '영상 분석 작업(Job) 및 처리 상태 이력';
 
-COMMENT ON COLUMN analysis_jobs.id IS '분석 Job ID';
+COMMENT ON COLUMN analysis_jobs.id IS '분석 Job ID (UUID)';
 COMMENT ON COLUMN analysis_jobs.video_id IS '분석 대상 영상 (videos.id)';
 COMMENT ON COLUMN analysis_jobs.status IS '작업 상태: PENDING / PROCESSING / COMPLETED / FAILED';
+COMMENT ON COLUMN analysis_jobs.accepted_at IS 'FastAPI가 분석 작업 요청을 정상 접수한 시각';
 COMMENT ON COLUMN analysis_jobs.started_at IS '분석 시작 시각';
 COMMENT ON COLUMN analysis_jobs.finished_at IS '분석 종료 시각 (성공/실패 공통)';
 COMMENT ON COLUMN analysis_jobs.retry_count IS '자동 재시도 횟수';
@@ -99,7 +100,6 @@ COMMENT ON COLUMN analysis_jobs.error_code IS '실패 코드';
 COMMENT ON COLUMN analysis_jobs.error_message IS '실패 메시지';
 COMMENT ON COLUMN analysis_jobs.created_at IS 'Job 생성(분석 요청) 시각';
 COMMENT ON COLUMN analysis_jobs.updated_at IS '최종 수정 시각';
-COMMENT ON COLUMN analysis_jobs.accepted_at IS 'FastAPI가 분석 작업 요청을 정상 접수한 시각';
 
 
 

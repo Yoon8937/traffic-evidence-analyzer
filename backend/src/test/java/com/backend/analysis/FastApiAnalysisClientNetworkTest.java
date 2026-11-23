@@ -27,7 +27,8 @@ class FastApiAnalysisClientNetworkTest {
         FastApiAnalysisClient client = new FastApiAnalysisClient(
                 restTemplate,
                 JsonMapper.builder().build(),
-                "http://localhost:8000"
+                "http://localhost:8000",
+                "test-internal-token"
         );
 
         FastApiAcceptanceResult result = client.submit(UUID.randomUUID(), UUID.randomUUID(), "videos/key.MOV");
@@ -45,12 +46,51 @@ class FastApiAnalysisClientNetworkTest {
         FastApiAnalysisClient client = new FastApiAnalysisClient(
                 restTemplate,
                 JsonMapper.builder().build(),
-                "http://localhost:8000"
+                "http://localhost:8000",
+                "test-internal-token"
         );
 
         FastApiAcceptanceResult result = client.submit(UUID.randomUUID(), UUID.randomUUID(), "videos/key.MOV");
 
         assertEquals(FastApiAcceptanceResult.OUTCOME_CONNECTION_FAILED, result.getOutcome());
         assertEquals("FASTAPI_CONNECTION_FAILED", result.getErrorCode());
+    }
+
+    @Test
+    void getJobStatus_timeout() {
+        RestTemplate restTemplate = mock(RestTemplate.class);
+        when(restTemplate.exchange(any(String.class), eq(HttpMethod.GET), any(HttpEntity.class), eq(String.class)))
+                .thenThrow(new ResourceAccessException("Read timed out", new SocketTimeoutException("Read timed out")));
+
+        FastApiAnalysisClient client = new FastApiAnalysisClient(
+                restTemplate,
+                JsonMapper.builder().build(),
+                "http://localhost:8000",
+                "test-internal-token"
+        );
+
+        FastApiJobStatusResponse result = client.getJobStatus(UUID.randomUUID());
+
+        assertEquals(FastApiJobStatusResponse.OUTCOME_TIMEOUT, result.getOutcome());
+        assertEquals(0, result.getHttpStatus());
+    }
+
+    @Test
+    void getJobStatus_connectionFailed() {
+        RestTemplate restTemplate = mock(RestTemplate.class);
+        when(restTemplate.exchange(any(String.class), eq(HttpMethod.GET), any(HttpEntity.class), eq(String.class)))
+                .thenThrow(new ResourceAccessException("Connection refused"));
+
+        FastApiAnalysisClient client = new FastApiAnalysisClient(
+                restTemplate,
+                JsonMapper.builder().build(),
+                "http://localhost:8000",
+                "test-internal-token"
+        );
+
+        FastApiJobStatusResponse result = client.getJobStatus(UUID.randomUUID());
+
+        assertEquals(FastApiJobStatusResponse.OUTCOME_CONNECTION_FAILED, result.getOutcome());
+        assertEquals(0, result.getHttpStatus());
     }
 }
