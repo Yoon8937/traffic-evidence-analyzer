@@ -20,9 +20,6 @@ import tools.jackson.databind.ObjectMapper;
 
 import java.net.SocketTimeoutException;
 import java.time.LocalDateTime;
-import java.time.OffsetDateTime;
-import java.time.format.DateTimeFormatter;
-import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -378,18 +375,7 @@ public class FastApiAnalysisClient {
     }
 
     private LocalDateTime parseUtcTimestamp(String raw) {
-        if (raw == null || raw.isBlank()) {
-            return null;
-        }
-        try {
-            OffsetDateTime parsed = OffsetDateTime.parse(raw, DateTimeFormatter.ISO_OFFSET_DATE_TIME);
-            if (parsed.getOffset().getTotalSeconds() != 0) {
-                return null;
-            }
-            return parsed.toLocalDateTime();
-        } catch (DateTimeParseException e) {
-            return null;
-        }
+        return UtcDateTimes.parse(raw);
     }
 
     private Long longOrNull(JsonNode node) {

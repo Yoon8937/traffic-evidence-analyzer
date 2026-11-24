@@ -15,6 +15,7 @@ import java.util.UUID;
 public class AnalysisJob {
 
     public static final String STATUS_PENDING = "PENDING";
+    public static final String STATUS_PROCESSING = "PROCESSING";
     public static final String STATUS_FAILED = "FAILED";
     public static final String STATUS_COMPLETED = "COMPLETED";
 
@@ -23,6 +24,13 @@ public class AnalysisJob {
 
     public static final String ERROR_DISPATCH_RETRY_EXHAUSTED = "DISPATCH_RETRY_EXHAUSTED";
     public static final String ERROR_RECOVERY_NOT_IMPLEMENTED = "RECOVERY_NOT_IMPLEMENTED";
+    public static final String ERROR_GET_NOT_FOUND = "GET_NOT_FOUND";
+    public static final String ERROR_GET_NOT_FOUND_EXHAUSTED = "GET_NOT_FOUND_EXHAUSTED";
+    public static final String ERROR_PROCESSING_TIMEOUT = "PROCESSING_TIMEOUT";
+
+    public static final String SCHEDULER_TASK_DISPATCH = "DISPATCH";
+    public static final String SCHEDULER_TASK_RECOVERY = "RECOVERY";
+    public static final String SCHEDULER_TASK_TIMEOUT = "TIMEOUT";
 
     @Id
     private UUID id;

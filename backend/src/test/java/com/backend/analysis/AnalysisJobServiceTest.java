@@ -14,6 +14,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import java.util.function.Consumer;
+
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.eq;
@@ -32,14 +34,29 @@ class AnalysisJobServiceTest {
     private AnalysisJobRepository analysisJobRepository;
     @Mock
     private FastApiAnalysisClient fastApiAnalysisClient;
+    @Mock
+    private AnalysisResultPersistService analysisResultPersistService;
+    @Mock
+    private AnalysisJobClaimService analysisJobClaimService;
 
     private AnalysisJobService analysisJobService;
 
     @BeforeEach
     void setUp() {
-        analysisJobService = new AnalysisJobService(analysisJobRepository, fastApiAnalysisClient);
+        analysisJobService = new AnalysisJobService(
+                analysisJobRepository,
+                fastApiAnalysisClient,
+                analysisResultPersistService,
+                analysisJobClaimService
+        );
         lenient().when(analysisJobRepository.save(any(AnalysisJob.class)))
                 .thenAnswer(invocation -> invocation.getArgument(0));
+        lenient().when(analysisJobClaimService.isDispatchInFlight(any()))
+                .thenReturn(false);
+        lenient().when(analysisJobClaimService.reserveDispatchAttempt(any(), anyInt()))
+                .thenReturn(true);
+        lenient().when(analysisJobClaimService.applyIfLeaseHeld(any(), any(), any(Boolean.class)))
+                .thenReturn(false);
     }
 
     @Test
@@ -250,7 +267,7 @@ class AnalysisJobServiceTest {
     }
 
     @Test
-    void check_completed_doesNotMarkAnalysisJobCompleted() {
+    void check_completed_persistsResultThroughSharedService() {
         AnalysisJob job = AnalysisJob.pendingJob(UUID.randomUUID());
         job.setErrorCode(AnalysisJob.ERROR_RECOVERY_NOT_IMPLEMENTED);
         FastApiJobStatusResponse response = remoteStatus("COMPLETED");
@@ -267,9 +284,7 @@ class AnalysisJobServiceTest {
         assertSame(response, returned);
         assertEquals(4L, returned.getSummary().getFrames());
         assertEquals(1, returned.getEvents().size());
-        assertEquals(AnalysisJob.STATUS_PENDING, job.getStatus());
-        assertEquals(AnalysisJob.ERROR_RECOVERY_NOT_IMPLEMENTED, job.getErrorCode());
-        assertNull(job.getFinishedAt());
+        verify(analysisResultPersistService).persistFromGet(job.getId(), response);
         verify(fastApiAnalysisClient, never()).submit(any(), any(), any());
     }
 
@@ -341,8 +356,24 @@ class AnalysisJobServiceTest {
         analysisJobService.checkFastApiJobStatus(job);
 
         assertEquals(AnalysisJob.STATUS_PENDING, job.getStatus());
-        assertEquals(AnalysisJob.ERROR_RECOVERY_NOT_IMPLEMENTED, job.getErrorCode());
+        assertEquals(AnalysisJob.ERROR_GET_NOT_FOUND, job.getErrorCode());
         assertEquals("GET recovery is still needed", job.getErrorMessage());
+        verify(fastApiAnalysisClient, never()).submit(any(), any(), any());
+    }
+
+    @Test
+    void check_notFoundTwiceStopsAutomaticRecovery() {
+        AnalysisJob job = AnalysisJob.pendingJob(UUID.randomUUID());
+        job.setErrorCode(AnalysisJob.ERROR_GET_NOT_FOUND);
+        FastApiJobStatusResponse response = new FastApiJobStatusResponse();
+        response.setOutcome(FastApiJobStatusResponse.OUTCOME_NOT_FOUND);
+        response.setHttpStatus(404);
+        when(fastApiAnalysisClient.getJobStatus(job.getId())).thenReturn(response);
+
+        analysisJobService.checkFastApiJobStatus(job);
+
+        assertEquals(AnalysisJob.STATUS_PENDING, job.getStatus());
+        assertEquals(AnalysisJob.ERROR_GET_NOT_FOUND_EXHAUSTED, job.getErrorCode());
         verify(fastApiAnalysisClient, never()).submit(any(), any(), any());
     }
 
@@ -397,6 +428,143 @@ class AnalysisJobServiceTest {
         assertNull(job.getAcceptedAt());
         assertEquals(FastApiAcceptanceResult.ERROR_RESPONSE_INVALID, job.getErrorCode());
         assertEquals(AnalysisJob.STATUS_PENDING, job.getStatus());
+    }
+
+    @Test
+    void processingTimeoutMarksFailedUnlessCompleted() {
+        AnalysisJob job = AnalysisJob.pendingJob(UUID.randomUUID());
+        job.setStatus(AnalysisJob.STATUS_PROCESSING);
+        when(analysisJobRepository.findByIdForUpdate(job.getId())).thenReturn(java.util.Optional.of(job));
+        analysisJobService.markProcessingTimeout(job);
+        assertEquals(AnalysisJob.STATUS_FAILED, job.getStatus());
+        assertEquals(AnalysisJob.ERROR_PROCESSING_TIMEOUT, job.getErrorCode());
+    }
+
+    @Test
+    void processingTimeoutDoesNotChangeCompletedJob() {
+        AnalysisJob job = AnalysisJob.pendingJob(UUID.randomUUID());
+        job.setStatus(AnalysisJob.STATUS_COMPLETED);
+        when(analysisJobRepository.findByIdForUpdate(job.getId())).thenReturn(java.util.Optional.of(job));
+        analysisJobService.markProcessingTimeout(job);
+        assertEquals(AnalysisJob.STATUS_COMPLETED, job.getStatus());
+        verify(analysisJobRepository, never()).save(job);
+    }
+
+    @Test
+    void dispatch_inFlightRetryCountTwoSendsHttpInsteadOfExhausting() {
+        AnalysisJob job = AnalysisJob.pendingJob(UUID.randomUUID());
+        job.setErrorCode(FastApiAcceptanceResult.ERROR_QUEUE_FULL);
+        job.setRetryCount(2);
+        job.setUpdatedAt(LocalDateTime.now());
+        when(analysisJobClaimService.isDispatchInFlight(job.getId())).thenReturn(true);
+        when(fastApiAnalysisClient.submit(job.getId(), job.getVideoId(), OBJECT_KEY))
+                .thenReturn(accepted(LocalDateTime.of(2026, 11, 24, 5, 0)));
+
+        analysisJobService.dispatchToFastApi(job, OBJECT_KEY);
+
+        assertEquals(AnalysisJob.STATUS_PENDING, job.getStatus());
+        assertEquals(LocalDateTime.of(2026, 11, 24, 5, 0), job.getAcceptedAt());
+        assertEquals(Integer.valueOf(2), job.getRetryCount());
+        verify(fastApiAnalysisClient).submit(job.getId(), job.getVideoId(), OBJECT_KEY);
+        verify(analysisJobClaimService).setDispatchInFlight(job.getId(), false);
+    }
+
+    @Test
+    void dispatch_retryCountTwoWithoutInFlightExhaustsWithoutHttp() {
+        AnalysisJob job = AnalysisJob.pendingJob(UUID.randomUUID());
+        job.setErrorCode(FastApiAcceptanceResult.ERROR_QUEUE_FULL);
+        job.setRetryCount(2);
+        job.setUpdatedAt(LocalDateTime.now());
+        when(analysisJobClaimService.isDispatchInFlight(job.getId())).thenReturn(false);
+
+        analysisJobService.dispatchToFastApi(job, OBJECT_KEY);
+
+        assertEquals(AnalysisJob.STATUS_FAILED, job.getStatus());
+        assertEquals(AnalysisJob.ERROR_DISPATCH_RETRY_EXHAUSTED, job.getErrorCode());
+        verify(fastApiAnalysisClient, never()).submit(any(), any(), any());
+    }
+
+    @Test
+    void dispatch_lostLeaseAfterHttpDoesNotSaveStaleJob() {
+        AnalysisJob job = AnalysisJob.pendingJob(UUID.randomUUID());
+        job.setErrorCode(FastApiAcceptanceResult.ERROR_QUEUE_FULL);
+        job.setRetryCount(1);
+        job.setUpdatedAt(LocalDateTime.now().minusSeconds(5));
+        SchedulerLease lease = new SchedulerLease(
+                job.getId(),
+                "old-owner",
+                AnalysisJob.SCHEDULER_TASK_DISPATCH,
+                "token-old"
+        );
+        when(analysisJobClaimService.reserveDispatchAttempt(lease, 2)).thenReturn(true);
+        when(fastApiAnalysisClient.submit(job.getId(), job.getVideoId(), OBJECT_KEY))
+                .thenReturn(accepted(LocalDateTime.of(2026, 11, 24, 6, 0)));
+        when(analysisJobClaimService.applyIfLeaseHeld(eq(lease), any(), eq(true))).thenReturn(false);
+
+        analysisJobService.dispatchToFastApi(job, OBJECT_KEY, lease);
+
+        verify(fastApiAnalysisClient).submit(job.getId(), job.getVideoId(), OBJECT_KEY);
+        assertNull(job.getAcceptedAt());
+        assertEquals(AnalysisJob.STATUS_PENDING, job.getStatus());
+        verify(analysisJobRepository, never()).save(job);
+    }
+
+    @Test
+    void processingTimeoutDoesNotOverwriteCompletedCommittedAfterGet() {
+        AnalysisJob stale = AnalysisJob.pendingJob(UUID.randomUUID());
+        stale.setStatus(AnalysisJob.STATUS_PROCESSING);
+        AnalysisJob committed = AnalysisJob.pendingJob(stale.getVideoId());
+        committed.setId(stale.getId());
+        committed.setStatus(AnalysisJob.STATUS_COMPLETED);
+        committed.setFinishedAt(LocalDateTime.of(2026, 11, 24, 7, 0));
+        when(analysisJobRepository.findByIdForUpdate(stale.getId())).thenReturn(java.util.Optional.of(committed));
+
+        analysisJobService.markProcessingTimeout(stale);
+
+        assertEquals(AnalysisJob.STATUS_COMPLETED, stale.getStatus());
+        assertEquals(LocalDateTime.of(2026, 11, 24, 7, 0), stale.getFinishedAt());
+        verify(analysisJobRepository, never()).save(any(AnalysisJob.class));
+    }
+
+    @Test
+    void processingTimeoutWithLeaseDoesNotOverwriteCompletedJob() {
+        AnalysisJob stale = AnalysisJob.pendingJob(UUID.randomUUID());
+        stale.setStatus(AnalysisJob.STATUS_PROCESSING);
+        SchedulerLease lease = new SchedulerLease(
+                stale.getId(),
+                "timeout-owner",
+                AnalysisJob.SCHEDULER_TASK_TIMEOUT,
+                "token-timeout"
+        );
+        when(analysisJobClaimService.applyIfLeaseHeld(eq(lease), any(), eq(false))).thenAnswer(invocation -> {
+            Consumer<AnalysisJob> writer = invocation.getArgument(1);
+            AnalysisJob committed = AnalysisJob.pendingJob(stale.getVideoId());
+            committed.setId(stale.getId());
+            committed.setStatus(AnalysisJob.STATUS_COMPLETED);
+            writer.accept(committed);
+            return true;
+        });
+
+        analysisJobService.markProcessingTimeout(stale, lease);
+
+        verify(analysisJobRepository, never()).save(any(AnalysisJob.class));
+    }
+
+    @Test
+    void processingTimeoutDoesNotChangeAlreadyFailedJob() {
+        AnalysisJob stale = AnalysisJob.pendingJob(UUID.randomUUID());
+        stale.setStatus(AnalysisJob.STATUS_PROCESSING);
+        AnalysisJob committed = AnalysisJob.pendingJob(stale.getVideoId());
+        committed.setId(stale.getId());
+        committed.setStatus(AnalysisJob.STATUS_FAILED);
+        committed.setErrorCode("ANALYSIS_FAILED");
+        when(analysisJobRepository.findByIdForUpdate(stale.getId())).thenReturn(java.util.Optional.of(committed));
+
+        analysisJobService.markProcessingTimeout(stale);
+
+        assertEquals(AnalysisJob.STATUS_FAILED, stale.getStatus());
+        assertEquals("ANALYSIS_FAILED", stale.getErrorCode());
+        verify(analysisJobRepository, never()).save(any(AnalysisJob.class));
     }
 
     @Test

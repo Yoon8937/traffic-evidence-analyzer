@@ -10,6 +10,8 @@ import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
+import java.util.UUID;
+import java.util.function.Consumer;
 
 @Service
 public class AnalysisJobService {
@@ -30,18 +32,25 @@ public class AnalysisJobService {
 
     public static final Set<String> STATUS_RECOVERY_ERROR_CODES = Set.of(
             AnalysisJob.ERROR_RECOVERY_NOT_IMPLEMENTED,
-            FastApiAcceptanceResult.ERROR_RESPONSE_INVALID
+            FastApiAcceptanceResult.ERROR_RESPONSE_INVALID,
+            AnalysisJob.ERROR_GET_NOT_FOUND
     );
 
     private final AnalysisJobRepository analysisJobRepository;
     private final FastApiAnalysisClient fastApiAnalysisClient;
+    private final AnalysisResultPersistService analysisResultPersistService;
+    private final AnalysisJobClaimService analysisJobClaimService;
 
     public AnalysisJobService(
             AnalysisJobRepository analysisJobRepository,
-            FastApiAnalysisClient fastApiAnalysisClient
+            FastApiAnalysisClient fastApiAnalysisClient,
+            AnalysisResultPersistService analysisResultPersistService,
+            AnalysisJobClaimService analysisJobClaimService
     ) {
         this.analysisJobRepository = analysisJobRepository;
         this.fastApiAnalysisClient = fastApiAnalysisClient;
+        this.analysisResultPersistService = analysisResultPersistService;
+        this.analysisJobClaimService = analysisJobClaimService;
     }
 
     public AnalysisJob newPendingJob(Video video) {
@@ -78,12 +87,28 @@ public class AnalysisJobService {
     }
 
     public FastApiJobStatusResponse recoverJobStatus(AnalysisJob job) {
+        return recoverJobStatus(job, null);
+    }
+
+    public FastApiJobStatusResponse recoverJobStatus(AnalysisJob job, SchedulerLease lease) {
         FastApiJobStatusResponse response = fastApiAnalysisClient.getJobStatus(job.getId());
-        applyStatusResponse(job, response);
+        applyFetchedStatus(job, response, lease);
         return response;
     }
 
+    public void applyFetchedStatus(AnalysisJob job, FastApiJobStatusResponse response) {
+        applyFetchedStatus(job, response, null);
+    }
+
+    public void applyFetchedStatus(AnalysisJob job, FastApiJobStatusResponse response, SchedulerLease lease) {
+        applyStatusResponse(job, response, lease);
+    }
+
     public void dispatchToFastApi(AnalysisJob job, String objectKey) {
+        dispatchToFastApi(job, objectKey, null);
+    }
+
+    public void dispatchToFastApi(AnalysisJob job, String objectKey, SchedulerLease lease) {
         putJobContext(job);
         MDC.put("status", job.getStatus());
         try {
@@ -99,31 +124,158 @@ public class AnalysisJobService {
                 return;
             }
             if (isAwaitingRetry(job)) {
+                boolean inFlight = analysisJobClaimService.isDispatchInFlight(job.getId());
                 int resends = resendCount(job);
-                if (resends >= AnalysisJob.MAX_DISPATCH_RESENDS) {
-                    markRetryExhausted(job, job.getErrorCode(), job.getErrorMessage());
+                if (resends >= AnalysisJob.MAX_DISPATCH_RESENDS && !inFlight) {
+                    writeJob(job, lease, current -> markRetryExhausted(
+                            current,
+                            current.getErrorCode(),
+                            current.getErrorMessage()
+                    ), false);
                     return;
                 }
-                if (!isRetryDue(job, resends)) {
-                    log.info("FastAPI retry is waiting");
-                    return;
+                if (!inFlight) {
+                    if (!isRetryDue(job, resends)) {
+                        log.info("FastAPI retry is waiting");
+                        return;
+                    }
+                    if (!reserveRetryAttempt(job, lease, resends + 1)) {
+                        log.warn("FastAPI retry reserve skipped because scheduler lease is no longer held");
+                        return;
+                    }
+                } else {
+                    log.info("FastAPI dispatch resumed after in-flight interruption");
                 }
-                job.setRetryCount(resends + 1);
-                job.setUpdatedAt(LocalDateTime.now());
-                analysisJobRepository.save(job);
             }
 
             log.info("FastAPI analysis request started");
             // 동시 제출 상한은 이 submit 직전에 둔다. 업로드 경로와 나중 재시도 호출이 같은 지점을 지난다.
             FastApiAcceptanceResult result = fastApiAnalysisClient.submit(job.getId(), job.getVideoId(), objectKey);
-            applyResult(job, result);
+            writeJob(job, lease, current -> applyResult(current, result), true);
         } catch (RuntimeException e) {
             MDC.put("error_type", e.getClass().getSimpleName());
             log.error("FastAPI request failed");
-            scheduleOrExhaust(job, FastApiAcceptanceResult.ERROR_REQUEST_FAILED, "FastAPI request failed");
+            writeJob(
+                    job,
+                    lease,
+                    current -> scheduleOrExhaust(
+                            current,
+                            FastApiAcceptanceResult.ERROR_REQUEST_FAILED,
+                            "FastAPI request failed"
+                    ),
+                    true
+            );
         } finally {
             clearJobContext();
         }
+    }
+
+    public void markProcessingTimeout(AnalysisJob job) {
+        markProcessingTimeout(job, null);
+    }
+
+    public void markProcessingTimeout(AnalysisJob job, SchedulerLease lease) {
+        if (job == null || job.getId() == null) {
+            return;
+        }
+        if (lease != null) {
+            boolean applied = analysisJobClaimService.applyIfLeaseHeld(lease, this::markProcessingTimeoutLocked, false);
+            if (!applied) {
+                log.warn("processing timeout skipped because scheduler lease is no longer held");
+            }
+            return;
+        }
+        AnalysisJob current = reloadForUpdate(job.getId());
+        if (current == null) {
+            log.warn("processing timeout skipped because job row could not be locked");
+            return;
+        }
+        markProcessingTimeoutLocked(current);
+        copyJobState(current, job);
+    }
+
+    private void markProcessingTimeoutLocked(AnalysisJob job) {
+        if (AnalysisJob.STATUS_COMPLETED.equals(job.getStatus())
+                || AnalysisJob.STATUS_FAILED.equals(job.getStatus())) {
+            log.warn("processing timeout skipped because job is already {}", job.getStatus());
+            return;
+        }
+        if (!AnalysisJob.STATUS_PROCESSING.equals(job.getStatus())) {
+            log.warn("processing timeout skipped because job status is {}", job.getStatus());
+            return;
+        }
+        job.setStatus(AnalysisJob.STATUS_FAILED);
+        job.setErrorCode(AnalysisJob.ERROR_PROCESSING_TIMEOUT);
+        job.setErrorMessage("PROCESSING timeout exceeded while FastAPI still reported PROCESSING");
+        job.setFinishedAt(LocalDateTime.now());
+        job.setUpdatedAt(LocalDateTime.now());
+        analysisJobRepository.save(job);
+        log.warn("job marked FAILED after PROCESSING timeout");
+    }
+
+    private boolean reserveRetryAttempt(AnalysisJob job, SchedulerLease lease, int retryCount) {
+        if (lease != null) {
+            boolean reserved = analysisJobClaimService.reserveDispatchAttempt(lease, retryCount);
+            if (reserved) {
+                job.setRetryCount(retryCount);
+                job.setUpdatedAt(LocalDateTime.now());
+            }
+            return reserved;
+        }
+        job.setRetryCount(retryCount);
+        job.setUpdatedAt(LocalDateTime.now());
+        analysisJobRepository.save(job);
+        analysisJobClaimService.setDispatchInFlight(job.getId(), true);
+        return true;
+    }
+
+    private void writeJob(
+            AnalysisJob job,
+            SchedulerLease lease,
+            Consumer<AnalysisJob> writer,
+            boolean clearDispatchInFlight
+    ) {
+        if (lease == null) {
+            AnalysisJob current = reloadForUpdate(job.getId());
+            if (current == null) {
+                writer.accept(job);
+            } else {
+                writer.accept(current);
+                copyJobState(current, job);
+            }
+            if (clearDispatchInFlight && job.getId() != null) {
+                analysisJobClaimService.setDispatchInFlight(job.getId(), false);
+            }
+            return;
+        }
+        boolean applied = analysisJobClaimService.applyIfLeaseHeld(lease, fresh -> {
+            writer.accept(fresh);
+            copyJobState(fresh, job);
+        }, clearDispatchInFlight);
+        if (!applied) {
+            log.warn("job write skipped because scheduler lease is no longer held");
+        }
+    }
+
+    private AnalysisJob reloadForUpdate(UUID jobId) {
+        if (jobId == null) {
+            return null;
+        }
+        return analysisJobRepository.findByIdForUpdate(jobId).orElse(null);
+    }
+
+    private void copyJobState(AnalysisJob source, AnalysisJob target) {
+        if (source == null || target == null || source == target) {
+            return;
+        }
+        target.setStatus(source.getStatus());
+        target.setAcceptedAt(source.getAcceptedAt());
+        target.setStartedAt(source.getStartedAt());
+        target.setFinishedAt(source.getFinishedAt());
+        target.setRetryCount(source.getRetryCount());
+        target.setErrorCode(source.getErrorCode());
+        target.setErrorMessage(source.getErrorMessage());
+        target.setUpdatedAt(source.getUpdatedAt());
     }
 
     private void applyResult(AnalysisJob job, FastApiAcceptanceResult result) {
@@ -213,10 +365,14 @@ public class AnalysisJobService {
         analysisJobRepository.save(job);
     }
 
-    private void applyStatusResponse(AnalysisJob job, FastApiJobStatusResponse response) {
+    private void applyStatusResponse(AnalysisJob job, FastApiJobStatusResponse response, SchedulerLease lease) {
         if (response == null) {
             return;
         }
+        writeJob(job, lease, current -> applyStatusResponseLocked(current, response), false);
+    }
+
+    private void applyStatusResponseLocked(AnalysisJob job, FastApiJobStatusResponse response) {
         if (FastApiJobStatusResponse.OUTCOME_NOT_FOUND.equals(response.getOutcome())) {
             rememberGetNotFound(job);
             return;
@@ -226,6 +382,10 @@ public class AnalysisJobService {
         }
         if ("ACCEPTED".equals(response.getStatus())) {
             applyAcceptedStatus(job, response);
+            return;
+        }
+        if ("COMPLETED".equals(response.getStatus())) {
+            analysisResultPersistService.persistFromGet(job.getId(), response);
             return;
         }
         if ("FAILED".equals(response.getStatus())) {
@@ -245,7 +405,8 @@ public class AnalysisJobService {
     }
 
     private void applyFailedStatus(AnalysisJob job, FastApiJobStatusResponse response) {
-        if (AnalysisJob.STATUS_COMPLETED.equals(job.getStatus())) {
+        if (AnalysisJob.STATUS_COMPLETED.equals(job.getStatus())
+                || AnalysisJob.STATUS_FAILED.equals(job.getStatus())) {
             return;
         }
         job.setStatus(AnalysisJob.STATUS_FAILED);
@@ -263,10 +424,21 @@ public class AnalysisJobService {
     }
 
     private void rememberGetNotFound(AnalysisJob job) {
-        if (isTerminalStatus(job) || job.getErrorCode() != null) {
+        if (isTerminalStatus(job)) {
             return;
         }
-        job.setErrorCode(AnalysisJob.ERROR_RECOVERY_NOT_IMPLEMENTED);
+        if (AnalysisJob.ERROR_GET_NOT_FOUND_EXHAUSTED.equals(job.getErrorCode())) {
+            return;
+        }
+        if (AnalysisJob.ERROR_GET_NOT_FOUND.equals(job.getErrorCode())) {
+            job.setErrorCode(AnalysisJob.ERROR_GET_NOT_FOUND_EXHAUSTED);
+            job.setErrorMessage("FastAPI job was not found on repeated GET");
+            job.setUpdatedAt(LocalDateTime.now());
+            analysisJobRepository.save(job);
+            log.warn("GET not found exhausted; automatic recovery stopped");
+            return;
+        }
+        job.setErrorCode(AnalysisJob.ERROR_GET_NOT_FOUND);
         job.setErrorMessage("GET recovery is still needed");
         job.setUpdatedAt(LocalDateTime.now());
         analysisJobRepository.save(job);
