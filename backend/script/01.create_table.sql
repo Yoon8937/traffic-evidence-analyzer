@@ -10,6 +10,12 @@ ALTER TABLE users OWNER TO tvea;
 
 
 
+INSERT INTO public.users
+(id, username, email, "password", created_at)
+VALUES(1, 'test1', 'test1@gmail.com', '$2a$10$Qmg8ixW4cEepWDXKTfR34O22aDs5G5BMEyB5IUa.9JtDtNw6pF8s.', CURRENT_TIMESTAMP);
+
+
+
 CREATE TABLE videos (
                         id UUID PRIMARY KEY,
 
